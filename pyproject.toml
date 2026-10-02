@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asice"
+version = "0.1.0"
+description = "Adaptive Spatial Image Compression Engine: ROI-aware dataset compression for low-storage ML developers"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+]
+
+[project.optional-dependencies]
+roi = ["onnxruntime>=1.16"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+asice = "asice.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["asice*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
