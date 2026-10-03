@@ -77,9 +77,15 @@ class QuadtreeNode:
         return self.variance
 
     def leaves(self) -> List["QuadtreeNode"]:
-        """All leaf nodes under this node, in traversal order."""
+        """All leaf nodes under this node, in traversal order.
+
+        Zero-area leaves are excluded: after clipping to the true image
+        bounds (see _clip_leaves_to_bounds), a leaf that fell entirely
+        within the power-of-two padding region ends up with w<=0 or
+        h<=0, and carries no real image content at all.
+        """
         if self.is_leaf:
-            return [self]
+            return [self] if (self.w > 0 and self.h > 0) else []
         out: List[QuadtreeNode] = []
         for c in self.children:
             out.extend(c.leaves())
@@ -207,6 +213,22 @@ class QuadtreeDecomposer:
         root = self._split_node(pyr, range_cache, 0, 0, side)
         root.x, root.y, root.w, root.h = 0, 0, w, h  # report true (unpadded) extent at the root
         self._original_hw = (h, w)
+
+        if side != w or side != h:
+            # The padded region (rows >= h or columns >= w) is internal
+            # bookkeeping only — edge-extended filler so every split is a
+            # clean power-of-two bisection, never real image content. Every
+            # node's x/y/w/h up to here is in padded coordinates, same as
+            # the root was before the line above corrected it; clip every
+            # leaf the same way, or a leaf that happens to span the
+            # h/w boundary (e.g. a flat background merging rows 24-511 on
+            # a 32-tall image) reports a height that reaches into padding,
+            # and nothing downstream has any way to know that part of it
+            # isn't real. Found via dp_tiling: a merged tile's declared
+            # h=512 on a 32-row image silently produced a wrong stored
+            # colour value, because the merge used the (fabricated)
+            # padded rows in its weighted average.
+            _clip_leaves_to_bounds(root, h, w)
         return root
 
     def _split_node(
@@ -297,6 +319,21 @@ class _RangeCache:
         r = float((block.max(axis=0) - block.min(axis=0)).max())
         self._cache[key] = r
         return r
+
+
+def _clip_leaves_to_bounds(node: QuadtreeNode, height: int, width: int) -> None:
+    """Recursively clip every leaf's w/h so no leaf extends past the true
+    (unpadded) image bounds; a leaf entirely outside those bounds has its
+    children pruned to empty / is left with w<=0 or h<=0 so leaves()
+    callers can filter it (see leaves() below, which drops zero-area nodes).
+    Mutates in place.
+    """
+    if node.is_leaf:
+        node.w = max(0, min(node.w, width - node.x))
+        node.h = max(0, min(node.h, height - node.y))
+        return
+    for c in node.children:
+        _clip_leaves_to_bounds(c, height, width)
 
 
 def reconstruct(root: QuadtreeNode, height: int, width: int) -> np.ndarray:
