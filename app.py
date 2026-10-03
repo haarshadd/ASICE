@@ -1,14 +1,21 @@
-"""ASICE live demo (Increments 1-3): I/O -> ROI -> Quadtree, in the browser.
+"""ASICE live demo (Increments 1-5): I/O -> ROI -> Quadtree -> DP Tiling ->
+Huffman, in the browser.
 
 Run with:
     streamlit run app.py
 
-Shows, side by side, for an uploaded image:
+Shows, for an uploaded image:
     1. Original (Increment 1: ImageBuffer ingestion)
     2. ROI mask overlay (Increment 2: SaliencySegmenter)
-    3. Quadtree leaf boundaries (Increment 3: QuadtreeDecomposer), drawn over
-       the reconstructed image, so merged background blocks are visible as
-       flat-colour rectangles and the ROI region is visibly left untouched.
+    3. Quadtree leaf boundaries (Increment 3: QuadtreeDecomposer)
+    4. DP-tiled boundaries (Increment 4: DPTiler) — fewer, larger boxes than
+       panel 3 where adjacent background leaves merged
+    5. Decoded output (Increment 5: ConditionalSerializer, Huffman round
+       trip) — what the archive actually reconstructs, so you can see the
+       real end-to-end result, not just intermediate structures
+
+Plus final metrics: compression ratio, whether Huffman actually ran, total
+pipeline time, and whether ROI pixels survived the whole trip exactly.
 
 This is a demo/visualisation tool, not part of the asice package itself —
 it imports asice as a library, the same way any other client code would.
@@ -27,10 +34,15 @@ import streamlit as st
 from asice.io_buffer import ImageBuffer, ImageError
 from asice.quadtree import QuadtreeDecomposer, leaf_count, max_background_error, reconstruct
 from asice.roi import DEFAULT_MODEL_PATH, SaliencySegmenter, roi_coverage
+from asice.dp_tiling import DPTiler, tiling_leaf_count, reduction_ratio, tiles_to_image
+from asice.conditional_huffman import ConditionalSerializer
 
-st.set_page_config(page_title="ASICE — Increments 1-3", layout="wide")
-st.title("ASICE Pipeline — live demo (Increments 1-3)")
-st.caption("Core I/O -> ROI / saliency segmentation -> adaptive quadtree decomposition")
+st.set_page_config(page_title="ASICE — Increments 1-5", layout="wide")
+st.title("ASICE Pipeline — live demo (Increments 1-5)")
+st.caption(
+    "Core I/O -> ROI / saliency segmentation -> adaptive quadtree decomposition "
+    "-> DP tiling -> conditional Huffman serialization"
+)
 
 # ---------------------------------------------------------------- sidebar --
 
@@ -66,8 +78,25 @@ criterion = st.sidebar.selectbox(
 threshold = st.sidebar.slider("Threshold T", 1.0, 80.0, 12.0, 1.0)
 min_block = st.sidebar.select_slider("Minimum background block size", options=[1, 2, 4, 8, 16], value=2)
 
+st.sidebar.header("Increment 4 - DP Tiling")
+merge_tolerance_override = st.sidebar.checkbox("Override merge tolerance (default: reuse T)", value=False)
+merge_tolerance = (
+    st.sidebar.slider("Merge tolerance", 0.0, 80.0, threshold, 1.0)
+    if merge_tolerance_override else None
+)
+max_merge_run = st.sidebar.select_slider(
+    "Max merge run (safety cap)", options=[8, 16, 32, 64, 128], value=64
+)
+
+st.sidebar.header("Increment 5 - Huffman")
+target_cr = st.sidebar.slider(
+    "Target compression ratio", 1.0, 20.0, 4.0, 0.5,
+    help="If Stages 1-4 alone already reach this ratio, Huffman is skipped "
+    "(FR-6) — saves time with no quality cost.",
+)
+
 st.sidebar.divider()
-show_grid = st.sidebar.checkbox("Draw quadtree leaf boundaries", value=True)
+show_grid = st.sidebar.checkbox("Draw leaf/tile boundaries", value=True)
 max_side = st.sidebar.select_slider(
     "Downscale before processing (px, longest side)",
     options=[256, 512, 768, 1024, 1920, 0],
@@ -91,6 +120,23 @@ suffix = Path(uploaded.name).suffix or ".png"
 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
     tmp.write(uploaded.getbuffer())
     tmp_path = tmp.name
+
+
+def _draw_boundaries(base: np.ndarray, boxes, height: int, width: int) -> np.ndarray:
+    """boxes: iterable of objects with .x .y .w .h .is_roi (QuadtreeNode or Tile)."""
+    panel = base.copy()
+    for b in boxes:
+        y0, y1 = b.y, min(b.y + b.h, height)
+        x0, x1 = b.x, min(b.x + b.w, width)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        colour = (0, 255, 90) if b.is_roi else (255, 60, 60)
+        panel[y0, x0:x1] = colour
+        panel[y1 - 1, x0:x1] = colour
+        panel[y0:y1, x0] = colour
+        panel[y0:y1, x1 - 1] = colour
+    return panel
+
 
 try:
     # ---- Increment 1: ingest ----
@@ -133,75 +179,110 @@ try:
     root = dec.decompose(buf, mask)
     qt_time = time.perf_counter() - t0
 
-    recon = reconstruct(root, buf.height, buf.width)
+    recon_qt = reconstruct(root, buf.height, buf.width)
     n_leaves = leaf_count(root)
-    bg_err = max_background_error(root, buf.rgb_matrix)
-    roi_exact = bool(np.array_equal(buf.rgb_matrix[mask == 1], recon[mask == 1]))
+    bg_err_qt = max_background_error(root, buf.rgb_matrix)
+    roi_exact_qt = bool(np.array_equal(buf.rgb_matrix[mask == 1], recon_qt[mask == 1]))
 
-    # ---- build the three display panels ----
+    # ---- Increment 4: DP tiling ----
+    tiler = DPTiler(tolerance=merge_tolerance, max_merge_run=max_merge_run)
+    t0 = time.perf_counter()
+    tiles = tiler.analyze_adjacent_leaf_nodes(root, default_tolerance=threshold, original_rgb=buf.rgb_matrix)
+    dp_time = time.perf_counter() - t0
+
+    recon_dp = tiles_to_image(tiles, buf.height, buf.width)
+    n_tiles = tiling_leaf_count(tiles)
+    dp_reduction = reduction_ratio(n_leaves, n_tiles)
+    roi_exact_dp = bool(np.array_equal(buf.rgb_matrix[mask == 1], recon_dp[mask == 1]))
+
+    # ---- Increment 5: conditional Huffman serialization + decode ----
+    serializer = ConditionalSerializer(target_cr=target_cr)
+    t0 = time.perf_counter()
+    payload, ser_meta = serializer.serialize(tiles, raw_size_bytes=buf.raw_size_bytes)
+    ser_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    tiles_decoded = serializer.deserialize(payload)
+    decode_time = time.perf_counter() - t0
+
+    recon_final = tiles_to_image(tiles_decoded, buf.height, buf.width)
+    roi_exact_final = bool(np.array_equal(buf.rgb_matrix[mask == 1], recon_final[mask == 1]))
+
+    total_time = roi_time + qt_time + dp_time + ser_time + decode_time
+
+    # ---- build display panels ----
     roi_overlay = buf.rgb_matrix.copy()
     roi_overlay[mask == 1] = (
         0.55 * roi_overlay[mask == 1].astype(np.float32) + 0.45 * np.array([255, 60, 60])
     ).astype(np.uint8)
 
-    quadtree_panel = recon.copy()
-    if show_grid:
-        for leaf in root.leaves():
-            y0, y1 = leaf.y, min(leaf.y + leaf.h, buf.height)
-            x0, x1 = leaf.x, min(leaf.x + leaf.w, buf.width)
-            if y1 <= y0 or x1 <= x0:
-                continue
-            colour = (0, 255, 90) if leaf.is_roi else (255, 60, 60)
-            quadtree_panel[y0, x0:x1] = colour
-            quadtree_panel[y1 - 1, x0:x1] = colour
-            quadtree_panel[y0:y1, x0] = colour
-            quadtree_panel[y0:y1, x1 - 1] = colour
+    quadtree_panel = _draw_boundaries(recon_qt, root.leaves(), buf.height, buf.width) if show_grid else recon_qt
+    dp_panel = _draw_boundaries(recon_dp, tiles, buf.height, buf.width) if show_grid else recon_dp
 
     # ------------------------------------------------------------- layout --
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    row1 = st.columns(3)
+    with row1[0]:
         st.subheader("1. Original")
         st.image(buf.rgb_matrix, use_container_width=True)
         st.caption(f"{buf.width}x{buf.height} px")
 
-    with col2:
+    with row1[1]:
         st.subheader("2. ROI mask")
         st.image(roi_overlay, use_container_width=True)
         method_used = roi_meta.get("method", roi_method)
         note = " (fell back from u2net)" if roi_meta.get("fallback") else ""
         st.caption(f"method={method_used}{note} - coverage={coverage:.1%} - {roi_time:.2f}s")
 
-    with col3:
+    with row1[2]:
         st.subheader("3. Quadtree")
         st.image(quadtree_panel, use_container_width=True)
         st.caption(f"{n_leaves:,} leaves - {qt_time:.2f}s")
-        if show_grid:
-            st.caption("Green = ROI leaf (exact)   Red = background leaf (merged)")
+
+    row2 = st.columns(3)
+    with row2[0]:
+        st.subheader("4. DP tiling")
+        st.image(dp_panel, use_container_width=True)
+        st.caption(f"{n_tiles:,} tiles ({dp_reduction:.1%} fewer than Stage 3) - {dp_time:.2f}s")
+
+    with row2[1]:
+        st.subheader("5. Decoded (final)")
+        st.image(recon_final, use_container_width=True)
+        hstate = "Huffman" if ser_meta["huffman_used"] else "stored raw (target CR already met)"
+        st.caption(f"{hstate} - {len(payload):,} bytes - encode {ser_time:.2f}s / decode {decode_time:.2f}s")
+
+    with row2[2]:
+        st.subheader("Legend")
+        st.caption("🟩 ROI leaf/tile (exact)")
+        st.caption("🟥 Background leaf/tile (merged)")
+        st.caption("Panel 5 is what the archive actually decodes to — compare it to Panel 1.")
 
     st.divider()
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("ROI coverage", f"{coverage:.1%}")
-    m2.metric("Quadtree leaves", f"{n_leaves:,}")
-    m3.metric("Max background error", f"{bg_err:.1f}", help="Largest |reconstructed - original| over any background pixel.")
-    m4.metric("ROI exactly preserved", "Yes" if roi_exact else "No")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Final compression ratio", f"{ser_meta['final_cr']:.2f}:1")
+    m2.metric("Archive size", f"{len(payload):,} B", help=f"Raw size was {buf.raw_size_bytes:,} B")
+    m3.metric("Total pipeline time", f"{total_time:.2f}s")
+    m4.metric("ROI exact end-to-end", "Yes" if roi_exact_final else "No")
+    m5.metric("Max background error", f"{bg_err_qt:.1f}", help="Measured after Stage 3, before tiling/Huffman (neither changes pixel values).")
 
-    if not roi_exact:
-        st.warning(
-            "ROI region did not reconstruct pixel-exact - this should not happen; "
-            "please report this as a bug with the uploaded image."
+    if not roi_exact_final:
+        st.error(
+            "ROI region did NOT reconstruct pixel-exact after the full round trip "
+            "(encode -> decode). This breaks the core lossless-ROI guarantee — "
+            "please note the image and settings used."
         )
+    elif not roi_exact_qt or not roi_exact_dp:
+        st.warning("ROI was exact at an earlier stage but not reported consistently — investigate.")
 
-    with st.expander("What am I looking at?"):
+    with st.expander("Stage-by-stage detail"):
         st.markdown(
-            "- **ROI mask**: pixels the saliency method marked as important; "
-            "these are preserved exactly by the quadtree (FR-3).\n"
-            "- **Quadtree**: green boxes are ROI leaves (always 1x1 pixels - "
-            "too small to see as boxes unless you zoom); red boxes are "
-            "background leaves, merged wherever a block's colour "
-            f"{'variance' if criterion == 'variance' else 'range'} was under "
-            f"T={threshold:g} (FR-4). Fewer, larger red boxes = more compression.\n"
-            "- **Max background error**: worst-case pixel difference introduced "
-            "by merging background blocks. Should stay roughly proportional to T."
+            f"- **Stage 3 -> 4**: {n_leaves:,} quadtree leaves became {n_tiles:,} DP tiles "
+            f"({dp_reduction:.1%} reduction) by merging adjacent background leaves the "
+            "quadtree's own recursive split couldn't merge on its own.\n"
+            f"- **Stage 5**: {ser_meta['reason']}. Structural compression (Stages 1-4) alone "
+            f"reached {ser_meta['structural_cr']:.2f}:1; target was {target_cr:g}:1.\n"
+            "- **Panel 5 vs Panel 1**: this is the real test — the archive bytes were decoded "
+            "back into tiles and repainted into an image with no shortcuts. If ROI pixels "
+            "differ here, something is actually broken, not just visually subtle."
         )
 
 finally:
