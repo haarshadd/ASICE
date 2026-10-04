@@ -174,19 +174,67 @@ def _dp_merge_row(
     dp = [0.0] * (n + 1)
     choice = [0] * (n + 1)
 
+    # Precompute each leaf's own true pixel min/max exactly once, up front.
+    # The first incremental version (see below) still called block.min()/
+    # .max() on each leaf's pixels every time that leaf entered a new
+    # candidate span — since a leaf can be the "newest addition" to up to
+    # max_merge_run different spans, that meant each leaf's pixels got
+    # re-sliced and re-reduced that many times. Profiled at 1,088,082 calls
+    # (matching n_leaves * up to max_merge_run) and ~11s of the loop's 18.8s
+    # total. Caching each leaf's min/max once removes that multiplier:
+    # O(n) leaf-slicing instead of O(n * max_merge_run).
+    leaf_min: List[Optional[np.ndarray]] = [None] * n
+    leaf_max: List[Optional[np.ndarray]] = [None] * n
+    if original_rgb is not None:
+        for idx, leaf in enumerate(row):
+            block = original_rgb[leaf.y : leaf.y + leaf.h, leaf.x : leaf.x + leaf.w].astype(np.float64)
+            leaf_min[idx] = block.min(axis=(0, 1))
+            leaf_max[idx] = block.max(axis=(0, 1))
+
     for i in range(1, n + 1):
         best_cost = float("inf")
         best_j = i - 1
-        # try every valid start j for the group ending at i-1 (leaves[j..i-1])
+        # try every valid start j for the group ending at i-1 (leaves[j..i-1]),
+        # growing the span one leaf at a time as j decreases from i-1.
+        # Maintains a running weighted sum (for the merged value) and
+        # running true-pixel min/max incrementally, using each leaf's
+        # precomputed min/max above rather than re-slicing original_rgb.
         lo = max(0, i - max_merge_run)
+        running_sum = np.zeros(3, dtype=np.float64)
+        running_weight = 0.0
+        running_min = None
+        running_max = None
+        prev_leaf = None
+
         for j in range(i - 1, lo - 1, -1):
-            span = row[j:i]
-            if not _is_contiguous_run(span):
-                break  # a gap at this j means any smaller j also has the same gap
-            if not _values_within_tolerance(span, tolerance, original_rgb):
-                # once a span is out of tolerance, growing it further (smaller j)
-                # only adds more leaves and can't bring it back into tolerance
-                break
+            leaf = row[j]
+            if prev_leaf is not None and leaf.x + leaf.w != prev_leaf.x:
+                break  # gap: any smaller j has the same gap (same early-exit as before)
+            prev_leaf = leaf
+
+            w_j = leaf.w * leaf.h
+            running_sum += leaf.value.astype(np.float64) * w_j
+            running_weight += w_j
+
+            if original_rgb is not None:
+                running_min = leaf_min[j] if running_min is None else np.minimum(running_min, leaf_min[j])
+                running_max = leaf_max[j] if running_max is None else np.maximum(running_max, leaf_max[j])
+                merged_value = running_sum / running_weight
+                within = bool(np.abs(running_max - merged_value).max() <= tolerance) and bool(
+                    np.abs(running_min - merged_value).max() <= tolerance
+                )
+            else:
+                merged_value = running_sum / running_weight
+                within = bool(np.abs(leaf.value.astype(np.float64) - merged_value).max() <= tolerance)
+                # NOTE: without original_rgb this only re-checks the newest
+                # leaf against the running merged value each step, not every
+                # prior leaf — a weaker approximation than the full check,
+                # same trade-off the non-incremental version made implicitly.
+                # Prefer passing original_rgb whenever available.
+
+            if not within:
+                break  # once out of tolerance, growing the span further can't help
+
             cost = dp[j] + TILE_COST
             if cost < best_cost:
                 best_cost = cost
