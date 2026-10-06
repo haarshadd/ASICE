@@ -87,58 +87,97 @@ def _spectral_residual_saliency(rgb: np.ndarray) -> np.ndarray:
 def _mask_from_saliency(
     saliency: np.ndarray, percentile: float = 90.0, dilate_px: int = 5
 ) -> np.ndarray:
-    """Threshold a [0,1] saliency map into a binary mask, then pad it out.
+    """Convert a finite saliency map into a binary ROI mask.
 
-    Uses mean + k*std (the threshold from Hou & Zhang's original paper),
-    not a plain percentile. A percentile always marks exactly (100-p)% of
-    pixels as ROI even when the map is almost uniformly near-zero (e.g. a
-    flat background with only faint numerical ripple), which was pulling
-    in spurious low-saliency regions on synthetic/flat-background images.
-    mean + k*std instead adapts to how much real contrast is in the map:
-    a genuinely flat background yields an (almost) empty mask.
+    ``percentile`` is a real percentile now: ``90`` keeps pixels at or above
+    the 90th percentile of the saliency distribution. A near-constant map is
+    treated as having no detected ROI; otherwise a constant all-zero map would
+    pass a ``>= 0`` threshold and incorrectly mark the whole image as ROI.
 
-    `percentile` is kept as the tuning knob for backward compatibility /
-    CLI naming, translated internally to an equivalent k in mean+k*std.
-
-    Padding (dilation) is deliberate: a saliency map that clips the object's
-    edge would let the quadtree compress right up to the boundary, which is
-    the one place errors are most visible. A small safety margin costs a
-    little compression but protects the actual object.
+    The optional closing/hole-fill/dilation stage adds a safety margin around
+    the detected salient region. It is applied after thresholding so the same
+    post-processing is used for classical and U^2-Net saliency.
     """
-    # percentile=90 (default) -> k=3, matching the classic spectral-residual
-    # paper's "mean + 3*std" rule; higher percentile => stricter (higher k).
-    k = 3.0 * (percentile / 90.0)
-    thresh = float(saliency.mean() + k * saliency.std())
-    mask = (saliency >= thresh).astype(np.uint8)
+    saliency = np.asarray(saliency, dtype=np.float32)
+    if saliency.ndim != 2:
+        raise ROIError(f"Saliency map must be 2-D, got shape {saliency.shape}")
+    if not np.isfinite(saliency).all():
+        raise ROIError("Saliency map contains NaN or infinite values")
+    if not 0.0 <= percentile <= 100.0:
+        raise ROIError("Saliency percentile must be between 0 and 100")
+    if dilate_px < 0:
+        raise ROIError("ROI dilation must be >= 0")
 
-    # Spectral-residual saliency responds to contrast, so it lights up an
-    # object's *edges* strongly but its flat interior only weakly — a solid
-    # circle can threshold into a ring, not a disc. Close small gaps and
-    # fill fully-enclosed holes so the ROI covers the whole object, not
-    # just its outline. This is a real behaviour of the algorithm, not a
-    # rare edge case, so it's applied unconditionally rather than as an
-    # opt-in flag.
+    s_min = float(saliency.min())
+    s_max = float(saliency.max())
+    if s_max - s_min <= 1e-6:
+        return np.zeros(saliency.shape, dtype=np.uint8)
+
+    threshold = float(np.percentile(saliency, percentile))
+    # When the requested percentile lands exactly on the minimum (common for
+    # sparse saliency maps), ``>= threshold`` would classify the entire low
+    # saliency background as ROI. In that case keep only values above the
+    # minimum; a truly constant map was already handled above.
+    if threshold <= s_min + 1e-6:
+        mask = (saliency > s_min + 1e-6).astype(np.uint8)
+    else:
+        mask = (saliency >= threshold).astype(np.uint8)
+
+    # Spectral-residual saliency responds to contrast, so it can emphasize an
+    # object's boundary while leaving its interior weak. Closing and filling
+    # enclosed holes makes the protected region spatially more coherent.
     close_px = max(dilate_px, 3)
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1))
+    k_close = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1)
+    )
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
     mask = _fill_enclosed_holes(mask)
 
     if dilate_px > 0:
-        k_el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        k_el = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)
+        )
         mask = cv2.dilate(mask, k_el)
 
-    return mask
+    return mask.astype(np.uint8, copy=False)
 
 
 def _fill_enclosed_holes(mask: np.ndarray) -> np.ndarray:
-    """Fill background regions fully enclosed by ROI (flood-fill from the border)."""
+    """Fill background regions fully enclosed by ROI.
+
+    Uses connected-component labelling on the BACKGROUND (not a single
+    floodFill seed at (0,0)): any background component that touches the
+    image border is real background and stays 0; any background component
+    that touches no border is enclosed by ROI on all sides and gets filled.
+
+    A single-seed floodFill at (0,0) was used previously, which silently
+    breaks whenever the mask itself touches pixel (0,0) -- not a rare
+    edge case in practice: on a real wallpaper dataset, a u2net mask with
+    several scattered salient regions connected by morphological closing
+    reached the image's top-left corner, so the seed point was foreground
+    rather than background. floodFill then filled nothing (0 reachable
+    background pixels), so the old code treated the ENTIRE rest of the
+    image as "enclosed" and filled it to 1 -- the exact mechanism behind
+    several dataset-run images reporting 100% ROI coverage with max
+    background error 0.0, when the correct coverage was ~10%.
+    Connected-component border-touching is border-agnostic: it doesn't
+    matter whether the mask happens to touch (0,0) or the image centre.
+    """
     h, w = mask.shape
-    flood = mask.copy()
-    fill_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, fill_mask, (0, 0), 1)  # mark background reachable from the border
-    # Anything that's 0 in `mask` but wasn't reached by the flood is enclosed -> fill it.
-    enclosed = (flood == 0)
-    return np.where(enclosed, 1, mask).astype(np.uint8)
+    background = (mask == 0).astype(np.uint8)
+    n_labels, labels = cv2.connectedComponents(background, connectivity=8)
+
+    # Collect every label that touches any edge of the image -- those
+    # components are real, unenclosed background.
+    border_labels = set(labels[0, :].tolist()) | set(labels[-1, :].tolist())
+    border_labels |= set(labels[:, 0].tolist()) | set(labels[:, -1].tolist())
+    border_labels.discard(0)  # label 0 is foreground (mask==1), not a background component
+
+    filled = mask.copy()
+    for label in range(1, n_labels):
+        if label not in border_labels:
+            filled[labels == label] = 1  # enclosed on all sides -> fill
+    return filled.astype(np.uint8)
 
 
 def classical_roi_mask(image: ImageBuffer, percentile: float = 90.0, dilate_px: int = 5) -> np.ndarray:
@@ -151,71 +190,159 @@ def classical_roi_mask(image: ImageBuffer, percentile: float = 90.0, dilate_px: 
 # Backend 2: bundled U^2-Net(p) ONNX model
 # --------------------------------------------------------------------------
 
+# These are the channel-wise ImageNet statistics used by the official
+# U^2-Net RGB inference preprocessing (ToTensorLab(flag=0)).  The previous
+# implementation applied the red-channel statistics to all three channels,
+# which changes the model input and can materially degrade the saliency map.
+U2NET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+U2NET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _prepare_u2net_input(rgb: np.ndarray) -> np.ndarray:
+    """Prepare an RGB image exactly for the bundled fixed-size U^2-Net model.
+
+    The shipped u2netp ONNX graph expects ``NCHW`` float32 input at 320x320.
+    U^2-Net's reference preprocessing resizes to a square and applies
+    channel-wise RGB normalization before transposing to NCHW.
+    """
+    if not isinstance(rgb, np.ndarray) or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ROIError("U^2-Net expects an RGB HxWx3 image")
+    if rgb.shape[0] <= 0 or rgb.shape[1] <= 0:
+        raise ROIError("U^2-Net cannot process an empty image")
+
+    resized = cv2.resize(
+        rgb, (U2NET_INPUT_SIZE, U2NET_INPUT_SIZE), interpolation=cv2.INTER_AREA
+    )
+    x = resized.astype(np.float32, copy=False) / 255.0
+    x = (x - U2NET_MEAN) / U2NET_STD
+    chw = np.transpose(x, (2, 0, 1))[None, ...]
+    return np.ascontiguousarray(chw, dtype=np.float32)
+
+
+def _normalize_u2net_output(output: object, height: int, width: int) -> np.ndarray:
+    """Convert the primary U^2-Net output to a finite [0,1] HxW map.
+
+    The official U^2-Net inference code normalizes its first (d1) output with
+    min-max normalization before resizing it back to the original image size.
+    The ONNX exporter may expose that output either directly or inside a list
+    of outputs, so output extraction is handled separately from normalization.
+    """
+    if isinstance(output, (list, tuple)):
+        if not output:
+            raise ROIError("U^2-Net returned no outputs")
+        output = output[0]
+
+    pred = np.asarray(output)
+    pred = np.squeeze(pred)
+    if pred.ndim != 2:
+        raise ROIError(f"Unexpected U^2-Net output shape: {pred.shape}")
+    if not np.isfinite(pred).all():
+        raise ROIError("U^2-Net returned NaN or infinite saliency values")
+
+    # Match the official U^2-Net inference order: normalize the network
+    # prediction first, then resize the normalized probability map back to the
+    # original image dimensions. Resizing first can change the extrema and
+    # therefore change the min-max normalization itself.
+    p_min = float(pred.min())
+    p_max = float(pred.max())
+    if p_max - p_min <= 1e-6:
+        # A constant prediction contains no usable foreground/background
+        # separation. Treat it as an empty ROI instead of turning every pixel
+        # into ROI through a zero threshold.
+        return np.zeros((height, width), dtype=np.float32)
+
+    normalized = (pred.astype(np.float32, copy=False) - p_min) / (p_max - p_min)
+    normalized = np.clip(normalized, 0.0, 1.0).astype(np.float32, copy=False)
+    return cv2.resize(normalized, (width, height), interpolation=cv2.INTER_LINEAR).astype(
+        np.float32, copy=False
+    )
+
+
 @dataclass
 class _U2NetSession:
     """Lazily-loaded ONNX session, shared across images in a batch.
 
     Loading and provider selection happen once; extraction proper is a call
-    to .run() per image. Kept separate from SaliencySegmenter so a failed
-    load can be caught and reported once, not per image.
+    to .run() per image. The input/output names are cached so repeated images
+    do not repeatedly query the inference backend.
     """
 
     path: Path
     backend: str  # "onnxruntime" | "cv2.dnn"
     _ort_session: object = None
     _cv_net: object = None
+    _input_name: Optional[str] = None
+    _output_names: Optional[list[str]] = None
 
     @classmethod
     def load(cls, model_path: Path) -> "_U2NetSession":
+        model_path = Path(model_path).expanduser().resolve()
         if not model_path.is_file():
             raise ROIError(f"U^2-Net model not found at {model_path}")
 
-        # Prefer onnxruntime: broader operator support, faster on CPU.
+        # Prefer onnxruntime: broader operator support and a cleaner ONNX
+        # execution path. Import remains lazy because it is optional.
         try:
-            # Import lazily because onnxruntime is an optional dependency.
             import importlib
 
             ort = importlib.import_module("onnxruntime")
-
-            sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-            obj = cls(path=model_path, backend="onnxruntime")
-            obj._ort_session = sess
-            return obj
+            sess = ort.InferenceSession(
+                str(model_path), providers=["CPUExecutionProvider"]
+            )
+            inputs = sess.get_inputs()
+            if not inputs:
+                raise ROIError("U^2-Net ONNX model has no inputs")
+            return cls(
+                path=model_path,
+                backend="onnxruntime",
+                _ort_session=sess,
+                _input_name=inputs[0].name,
+            )
+        except ROIError:
+            raise
         except Exception as exc:
             log.warning("onnxruntime unavailable/failed (%s); trying cv2.dnn", exc)
 
-        # Fallback: OpenCV's built-in ONNX runner needs no extra dependency,
-        # but doesn't support every op U^2-Net variants can use.
+        # OpenCV is retained as a dependency-free fallback. Some U^2-Net ONNX
+        # exports contain operators/weights that OpenCV DNN cannot import; in
+        # that case the caller falls back to the classical saliency backend.
         try:
             net = cv2.dnn.readNetFromONNX(str(model_path))
-            obj = cls(path=model_path, backend="cv2.dnn")
-            obj._cv_net = net
-            return obj
+            names = list(net.getUnconnectedOutLayersNames())
+            if not names:
+                raise ROIError("U^2-Net OpenCV graph has no output nodes")
+            return cls(
+                path=model_path,
+                backend="cv2.dnn",
+                _cv_net=net,
+                _output_names=names,
+            )
+        except ROIError:
+            raise
         except Exception as exc:
-            raise ROIError(f"Could not load {model_path} with onnxruntime or cv2.dnn: {exc}") from exc
+            raise ROIError(
+                f"Could not load {model_path} with onnxruntime or cv2.dnn: {exc}"
+            ) from exc
 
     def run(self, rgb: np.ndarray) -> np.ndarray:
-        """Run the model on one RGB image, return a [0,1] saliency map at input resolution."""
+        """Run U^2-Net and return a [0,1] saliency map at input resolution."""
         h, w = rgb.shape[:2]
-        resized = cv2.resize(rgb, (U2NET_INPUT_SIZE, U2NET_INPUT_SIZE), interpolation=cv2.INTER_AREA)
-        x = resized.astype(np.float32) / 255.0
-        x = (x - 0.485) / 0.229  # ImageNet-ish normalisation used by U^2-Net training
-        chw = np.transpose(x, (2, 0, 1))[None, ...].astype(np.float32)
+        chw = _prepare_u2net_input(rgb)
 
-        if self.backend == "onnxruntime":
-            input_name = self._ort_session.get_inputs()[0].name
-            out = self._ort_session.run(None, {input_name: chw})[0]
-        else:
-            self._cv_net.setInput(chw)
-            out = self._cv_net.forward()
+        try:
+            if self.backend == "onnxruntime":
+                out = self._ort_session.run(None, {self._input_name: chw})
+            elif self.backend == "cv2.dnn":
+                self._cv_net.setInput(chw)
+                out = self._cv_net.forward(self._output_names)
+            else:  # pragma: no cover - guarded by construction
+                raise ROIError(f"Unknown U^2-Net backend: {self.backend}")
+        except ROIError:
+            raise
+        except Exception as exc:
+            raise ROIError(f"U^2-Net inference failed: {exc}") from exc
 
-        pred = np.squeeze(out)  # (320, 320), higher = more salient
-        pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_LINEAR)
-
-        p_min, p_max = float(pred.min()), float(pred.max())
-        if p_max - p_min < 1e-6:
-            return np.zeros((h, w), dtype=np.float32)
-        return ((pred - p_min) / (p_max - p_min)).astype(np.float32)
+        return _normalize_u2net_output(out, h, w)
 
 
 # --------------------------------------------------------------------------
@@ -250,8 +377,8 @@ class SaliencySegmenter:
     method: "classical" | "u2net" | "mask-dir"
     model_path: override for the bundled U^2-Net weights
     mask_dir: required when method == "mask-dir"
-    percentile: classical/u2net threshold — top (100 - percentile)% of the
-        saliency map is kept as ROI
+    percentile: classical/u2net saliency percentile. For example, 90 keeps
+        pixels at or above the 90th percentile before ROI morphology.
     dilate_px: safety margin added around the thresholded region
     """
 
@@ -263,6 +390,7 @@ class SaliencySegmenter:
 
     _session: Optional[_U2NetSession] = None
     _u2net_load_failed: bool = False
+    _u2net_failure_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.method not in ("classical", "u2net", "mask-dir"):
@@ -279,15 +407,30 @@ class SaliencySegmenter:
         if self.method == "u2net":
             mask = self._try_u2net(image)
             if mask is not None:
-                return mask, {"method": "u2net", "backend": self._session.backend}
-            # Model missing or failed to load: fall back rather than crash
-            # the whole batch, matching NFR-3's "never crash on bad input"
-            # spirit — a missing weight file is exactly this kind of case.
+                return mask, {
+                    "method": "u2net",
+                    "backend": self._session.backend,
+                    "percentile": self.percentile,
+                    "dilate_px": self.dilate_px,
+                }
+            # Model missing or inference failed: fall back rather than crash
+            # the whole batch. The metadata records the fallback so a paper
+            # benchmark cannot accidentally count a classical run as U^2-Net.
             log.warning("Falling back to classical saliency for %s", image.source_path)
 
         saliency = _spectral_residual_saliency(image.rgb_matrix)
-        mask = _mask_from_saliency(saliency, percentile=self.percentile, dilate_px=self.dilate_px)
-        return mask, {"method": "classical", "fallback": self.method == "u2net"}
+        mask = _mask_from_saliency(
+            saliency, percentile=self.percentile, dilate_px=self.dilate_px
+        )
+        meta = {
+            "method": "classical",
+            "fallback": self.method == "u2net",
+            "percentile": self.percentile,
+            "dilate_px": self.dilate_px,
+        }
+        if self.method == "u2net" and self._u2net_failure_reason:
+            meta["fallback_reason"] = self._u2net_failure_reason
+        return mask, meta
 
     def _try_u2net(self, image: ImageBuffer) -> Optional[np.ndarray]:
         if self._u2net_load_failed:
@@ -298,9 +441,18 @@ class SaliencySegmenter:
             except ROIError as exc:
                 log.warning("%s", exc)
                 self._u2net_load_failed = True
+                self._u2net_failure_reason = str(exc)
                 return None
-        saliency = self._session.run(image.rgb_matrix)
-        return _mask_from_saliency(saliency, percentile=self.percentile, dilate_px=self.dilate_px)
+        try:
+            saliency = self._session.run(image.rgb_matrix)
+            return _mask_from_saliency(
+                saliency, percentile=self.percentile, dilate_px=self.dilate_px
+            )
+        except ROIError as exc:
+            log.warning("U^2-Net failed for %s: %s", image.source_path, exc)
+            self._u2net_load_failed = True
+            self._u2net_failure_reason = str(exc)
+            return None
 
 
 def roi_coverage(mask: np.ndarray) -> float:

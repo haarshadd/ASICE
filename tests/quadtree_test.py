@@ -29,6 +29,31 @@ def _object_image(h=128, w=128, cx=64, cy=64, r=25, seed=0) -> tuple[ImageBuffer
     return ImageBuffer(rgb_matrix=img, source_path="obj.png"), mask
 
 
+def test_range_pyramid_matches_bruteforce_for_every_level():
+    """The optimized min/max pyramid must be exactly equivalent to block reductions."""
+    from asice.quadtree import _RangePyramid
+
+    rng = np.random.default_rng(123)
+    img = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    pyramid = _RangePyramid(img)
+    for size in (1, 2, 4, 8, 16, 32):
+        for y in range(0, 32, size):
+            for x in range(0, 32, size):
+                block = img[y:y + size, x:x + size].astype(np.float32)
+                expected = float((block.max(axis=(0, 1)) - block.min(axis=(0, 1))).max())
+                assert pyramid.max_range(x, y, size) == expected
+
+
+def test_range_criterion_ignores_min_block_when_bound_requires_splitting():
+    """Strict range mode must never stop at min_block if range(T) is violated."""
+    img = np.full((8, 8, 3), 100, np.uint8)
+    img[0, 0] = (120, 120, 120)
+    buf = ImageBuffer(rgb_matrix=img, source_path="range_floor.png")
+    dec = QuadtreeDecomposer(threshold=12, min_block=2, criterion="range")
+    root = dec.decompose(buf, np.zeros((8, 8), np.uint8))
+    assert max_background_error(root, img) <= 12 + 1e-6
+
+
 # ---------------- FR-3: ROI is exact ----------------
 def test_roi_region_reconstructs_pixel_exact():
     buf, mask = _object_image()
@@ -80,14 +105,19 @@ def test_flat_background_collapses_to_one_leaf():
     assert root.is_leaf
 
 
-def test_background_error_never_exceeds_half_threshold():
-    """Range-based merge guarantees max |reconstructed - original| <= T/2 on background."""
+def test_background_error_never_exceeds_threshold():
+    """Range-based merge guarantees max |reconstructed - original| <= T on background.
+
+    The leaf stores the block mean, which is inside [min, max]; therefore
+    a range <= T gives a hard per-channel error bound of T. A T/2 bound
+    would require storing the range midpoint rather than the mean.
+    """
     buf, mask = _object_image(seed=7)
     T = 14
     dec = QuadtreeDecomposer(threshold=T, criterion="range")
     root = dec.decompose(buf, mask)
     err = max_background_error(root, buf.rgb_matrix)
-    assert err <= T / 2 + 1e-6
+    assert err <= T + 1e-6
 
 
 def test_lower_threshold_never_increases_leaf_count():
@@ -127,7 +157,7 @@ def test_severe_non_uniformity_overrides_min_block_floor():
     dec = QuadtreeDecomposer(threshold=10, min_block=4)
     root = dec.decompose(buf, np.zeros((16, 16), np.uint8))
     err = max_background_error(root, img)
-    # not a hard T/2 guarantee (criterion is variance, not range, by default)
+    # Not a hard T guarantee: this intentionally exercises the fast variance criterion.
     # but must be far below the ~150 it was before the floor-override fix
     assert err < 50
 
@@ -170,7 +200,9 @@ def test_leaves_are_a_partition_no_gaps_no_overlap():
         region = coverage[leaf.y : leaf.y + leaf.h, leaf.x : leaf.x + leaf.w]
         assert (region == 0).all(), "overlap detected"
         coverage[leaf.y : leaf.y + leaf.h, leaf.x : leaf.x + leaf.w] = 1
-    assert coverage.sum() == side * side
+    assert coverage[:buf.height, :buf.width].sum() == buf.height * buf.width
+    assert coverage[buf.height:, :].sum() == 0
+    assert coverage[:, buf.width:].sum() == 0
 
 
 def test_evaluate_background_variance_is_zero_for_flat_background():
@@ -202,11 +234,11 @@ def test_all_roi_pixels_get_is_roi_true_leaves_only():
             assert not leaf.is_roi
 
 
-def test_default_criterion_is_variance_and_keeps_roi_exact():
-    """Default criterion must stay usable at realistic image sizes without exact-range cost."""
+def test_default_criterion_is_range_and_keeps_roi_exact():
+    """Range is the correctness-first default and still preserves ROI exactly."""
     buf, mask = _object_image(h=256, w=256, cx=128, cy=128, r=50, seed=11)
     dec = QuadtreeDecomposer(threshold=12)  # default criterion
-    assert dec.criterion == "variance"
+    assert dec.criterion == "range"
     root = dec.decompose(buf, mask)
     recon = reconstruct(root, buf.height, buf.width)
     assert np.array_equal(buf.rgb_matrix[mask == 1], recon[mask == 1])
@@ -217,4 +249,4 @@ def test_range_criterion_available_as_opt_in():
     dec = QuadtreeDecomposer(threshold=14, criterion="range")
     root = dec.decompose(buf, mask)
     err = max_background_error(root, buf.rgb_matrix)
-    assert err <= 14 / 2 + 1e-6
+    assert err <= 14 + 1e-6

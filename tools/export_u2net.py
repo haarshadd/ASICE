@@ -67,12 +67,25 @@ def main() -> int:
     model.load_state_dict(state)
     model.eval()
 
+    # U^2-Net returns seven side outputs. ASICE only needs the primary d0
+    # saliency prediction, so export a one-output wrapper instead of carrying
+    # six unused tensors through the ONNX runtime. This also makes output
+    # selection deterministic for onnxruntime and cv2.dnn.
+    class PrimarySaliency(torch.nn.Module):
+        def __init__(self, net):
+            super().__init__()
+            self.net = net
+
+        def forward(self, x):
+            return self.net(x)[0]
+
+    export_model = PrimarySaliency(model).eval()
     dummy = torch.randn(1, 3, 320, 320)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     torch.onnx.export(
-        model,
+        export_model,
         dummy,
         str(out_path),
         input_names=["input"],

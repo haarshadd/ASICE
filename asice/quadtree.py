@@ -17,12 +17,12 @@ Two uniformity criteria are available:
     variance-of-a-uniform-distribution); it is reported per image via
     max_background_error() rather than assumed.
   - "range": max channel value - min channel value <= T. Gives an exact
-    guarantee (|reconstructed - original| <= T/2 for every background
-    pixel) but needs true block min/max, which can't be computed via
-    cv2.resize's box filter — only via an explicit per-level reduction.
-    Kept for images/batches where the hard guarantee matters more than
-    speed (the paper's ablation, or small datasets), not the default
-    because that reduction is materially slower at 1080p+.
+    guarantee (|reconstructed - original| <= T for every background
+    pixel) when leaves store the block mean. The implementation uses a
+    multilevel 2x2 min/max pyramid built with OpenCV erosion/dilation, so
+    each quadtree node gets its exact range in O(1) lookup time. This is now
+    the correctness-first default; variance remains available as an
+    explicitly selected fast/heuristic alternative.
 
 A leaf's stored value is always the block's mean.
 
@@ -114,10 +114,11 @@ class _StatsPyramid:
     the squared image — both pyramids together are still far cheaper than
     one reshape-based pass.
 
-    True block min/max (needed for the "range" criterion) can't be produced
-    this way — cv2.resize has no box-min/box-max mode — so that path uses
-    a separate, slower reduction, built only down to the resolution the
-    tree actually needs it at (see QuadtreeDecomposer._range_min_max).
+    Exact block ranges for the "range" criterion are provided by
+    _RangePyramid below. It recursively applies 2x2 min/max pooling using
+    OpenCV's optimized erosion/dilation kernels and stores only one scalar
+    max-channel range per level, keeping memory substantially below storing
+    full RGB min/max pyramids.
     """
 
     def __init__(self, rgb: np.ndarray, roi_mask: np.ndarray) -> None:
@@ -180,7 +181,7 @@ class QuadtreeDecomposer:
 
     threshold: float = 12.0
     min_block: int = 2
-    criterion: Criterion = "variance"
+    criterion: Criterion = "range"
 
     def decompose(self, image: ImageBuffer, roi_mask: np.ndarray) -> QuadtreeNode:
         """Build the tree. roi_mask must be uint8 {0,1}, same HxW as image."""
@@ -208,7 +209,7 @@ class QuadtreeDecomposer:
             padded_rgb, padded_mask = rgb, roi_mask
 
         pyr = _StatsPyramid(padded_rgb, padded_mask)
-        range_cache = _RangeCache(padded_rgb) if self.criterion == "range" else None
+        range_cache = _RangePyramid(padded_rgb) if self.criterion == "range" else None
 
         root = self._split_node(pyr, range_cache, 0, 0, side)
         root.x, root.y, root.w, root.h = 0, 0, w, h  # report true (unpadded) extent at the root
@@ -232,7 +233,7 @@ class QuadtreeDecomposer:
         return root
 
     def _split_node(
-        self, pyr: "_StatsPyramid", range_cache: "Optional[_RangeCache]", x: int, y: int, size: int
+        self, pyr: "_StatsPyramid", range_cache: "Optional[_RangePyramid]", x: int, y: int, size: int
     ) -> QuadtreeNode:
         mean, max_var = pyr.stats(x, y, size)
         block_is_roi = pyr.roi_any(x, y, size)
@@ -244,31 +245,20 @@ class QuadtreeDecomposer:
         uniform_enough = metric <= self.threshold
         can_still_split = size > 1 and (size // 2) >= 1
 
-        # min_block caps recursion on backgrounds that are merely noisy
-        # (many small variations, no single bound-breaking outlier) so a
-        # pathological image can't blow up the leaf count. But capping
-        # unconditionally at min_block let a leaf's worst-case pixel error
-        # run far past T when the block's "noise" was actually a real hard
-        # edge in disguise — e.g. a quadtree leaf straddling an object's
-        # anti-aliased boundary, three similar pixels and one very
-        # different one, averaging to a variance near T while the actual
-        # per-pixel error was over 10x T (found via max_background_error()
-        # on a real image, not a hypothetical). So the floor is only
-        # honoured when the block is *merely* over threshold; a block many
-        # times over threshold is treated as "this really is a sharp edge,
-        # not noise" and allowed to keep splitting past min_block, down to
-        # 1x1 if needed. severity_factor=3 was picked so ordinary photo
-        # noise (which pushes variance a little over T) still gets capped,
-        # while a hard edge (which pushes variance far over T) does not.
-        severity_factor = 3.0
-        at_floor_but_severe = (not uniform_enough) and metric > self.threshold * severity_factor
-
+        # In strict range mode the threshold is a hard correctness bound, so
+        # min_block must NEVER permit a background leaf whose range exceeds T.
+        # The minimum-block floor remains useful for the variance/fast mode,
+        # where the criterion is explicitly heuristic.
         must_split = block_is_roi and size > 1  # FR-3: ROI never stops before 1x1
-        should_split = can_still_split and (
-            must_split
-            or (not uniform_enough and size > self.min_block)
-            or (not uniform_enough and size <= self.min_block and at_floor_but_severe)
-        )
+        if self.criterion == "range":
+            background_split = (not block_is_roi) and (not uniform_enough) and can_still_split
+        else:
+            severity_factor = 3.0
+            at_floor_but_severe = (not uniform_enough) and metric > self.threshold * severity_factor
+            background_split = (not uniform_enough and size > self.min_block) or (
+                not uniform_enough and size <= self.min_block and at_floor_but_severe
+            )
+        should_split = can_still_split and (must_split or background_split)
 
         if not should_split:
             return QuadtreeNode(x, y, size, size, block_is_roi, mean, max_var)
@@ -295,30 +285,66 @@ class QuadtreeDecomposer:
         return float(bg.reshape(-1, 3).var(axis=0).mean())
 
 
-class _RangeCache:
-    """On-demand, memoised block min/max for the "range" criterion.
+class _RangePyramid:
+    """Exact max-channel range for every power-of-two block size.
 
-    No fast box-filter equivalent exists for min/max (unlike mean/variance,
-    which cv2.resize computes natively), so each distinct block actually
-    visited by the traversal is reduced directly with NumPy the first time
-    it's asked for, and cached. This is still much cheaper than building a
-    full min/max pyramid up front, because a typical image only visits a
-    small fraction of all possible blocks.
+    Each level contains one scalar per block: the maximum, over RGB
+    channels, of (channel_max - channel_min). Starting from the pixel level,
+    the next level is formed by exact non-overlapping 2x2 min/max pooling.
+    OpenCV's erosion/dilation kernels execute those reductions in optimized
+    native code. Only the scalar range map is retained for every level; the
+    three-channel min/max images needed to construct the next level are
+    released as soon as that level is complete.
+
+    This changes the old range implementation from one NumPy reduction per
+    visited tree node to O(1) lookup per node after a small, linear pyramid
+    build, making the exact criterion practical as the default.
     """
 
+    _KERNEL = np.ones((2, 2), dtype=np.uint8)
+
     def __init__(self, rgb: np.ndarray) -> None:
-        self._rgb = rgb.astype(np.float32)
-        self._cache: dict[tuple[int, int, int], float] = {}
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise QuadtreeError(f"range pyramid expects HxWx3 RGB input, got {rgb.shape}")
+        side = rgb.shape[0]
+        if side != rgb.shape[1] or side < 1 or (side & (side - 1)) != 0:
+            raise QuadtreeError(f"range pyramid expects a non-empty power-of-two square, got {rgb.shape}")
+
+        # Keep the transient min/max pyramids in the source uint8 domain.
+        # RGB input is already bounded to [0,255], so float32 is unnecessary
+        # here and would quadruple the working memory on 4K images.
+        current_min = rgb.astype(np.uint8, copy=True)
+        current_max = current_min.copy()
+        n_levels = int(np.log2(side)) + 1
+        self._max_range: list[np.ndarray] = [None] * n_levels
+
+        # Pixel-level range is exactly zero.
+        self._max_range[0] = np.zeros((side, side), dtype=np.float32)
+
+        for lvl in range(1, n_levels):
+            eroded = cv2.erode(
+                current_min, self._KERNEL, anchor=(0, 0),
+                borderType=cv2.BORDER_REPLICATE,
+            )
+            dilated = cv2.dilate(
+                current_max, self._KERNEL, anchor=(0, 0),
+                borderType=cv2.BORDER_REPLICATE,
+            )
+            next_min = eroded[::2, ::2]
+            next_max = dilated[::2, ::2]
+            # Cast before subtraction: uint8 subtraction would wrap at 255.
+            self._max_range[lvl] = (
+                next_max.astype(np.int16) - next_min.astype(np.int16)
+            ).max(axis=2).astype(np.float32, copy=False)
+            current_min = next_min
+            current_max = next_max
+
+        self.n_levels = n_levels
 
     def max_range(self, x: int, y: int, size: int) -> float:
-        key = (x, y, size)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        block = self._rgb[y : y + size, x : x + size].reshape(-1, 3)
-        r = float((block.max(axis=0) - block.min(axis=0)).max())
-        self._cache[key] = r
-        return r
+        lvl = int(np.log2(size))
+        bx, by = x // size, y // size
+        return float(self._max_range[lvl][by, bx])
 
 
 def _clip_leaves_to_bounds(node: QuadtreeNode, height: int, width: int) -> None:

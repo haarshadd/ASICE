@@ -50,7 +50,7 @@ st.sidebar.header("Increment 2 - ROI")
 roi_method = st.sidebar.selectbox(
     "ROI method",
     ["classical", "u2net", "mask-dir"],
-    index=0,
+    index=1,
     help="classical needs no model file and always works. u2net needs "
     "asice/models/u2netp.onnx to be present, and otherwise falls back "
     "to classical automatically.",
@@ -60,7 +60,7 @@ if roi_method == "mask-dir":
     mask_dir_input = st.sidebar.text_input("Mask folder path")
 percentile = st.sidebar.slider(
     "Sensitivity (percentile)", 50.0, 99.0, 90.0, 1.0,
-    help="Internally converted to a mean + k*std threshold on the saliency map.",
+    help="Keep pixels at or above this saliency percentile before ROI morphology.",
 )
 dilate_px = st.sidebar.slider("ROI safety margin (px)", 0, 30, 5)
 

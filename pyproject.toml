@@ -10,10 +10,10 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
+    "onnxruntime>=1.16",
 ]
 
 [project.optional-dependencies]
-roi = ["onnxruntime>=1.16"]
 dev = ["pytest>=7"]
 
 [project.scripts]
@@ -21,6 +21,9 @@ asice = "asice.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["asice*"]
+
+[tool.setuptools.package-data]
+asice = ["models/*.onnx", "models/*.onnx.data", "models/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
