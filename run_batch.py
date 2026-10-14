@@ -6,7 +6,7 @@ from asice.pipeline import compress_dataset, PipelineConfig
 
 cfg = PipelineConfig(
     mode="strict",
-    threshold=12,
+    threshold=12.0,
     target_cr=4.0,
     roi_method="u2net",  # Updated: use the fixed U²-Net ROI pipeline
 )
@@ -69,3 +69,10 @@ print(f"ROI exact rate     : {batch.roi_exact_rate:.0%}")
 print(f"Total pipeline time: {batch.total_time_s:.2f}s")
 print(f"Wall-clock time    : {batch_elapsed:.2f}s")
 print("=" * 80)
+
+import csv
+with open("batch_results.csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["name", "roi_coverage", "final_cr", "total_time_s"])
+    w.writeheader()
+    for r in batch.results:
+        w.writerow({"name": r.name, "roi_coverage": r.roi_coverage, "final_cr": r.final_cr, "total_time_s": r.total_time_s})
