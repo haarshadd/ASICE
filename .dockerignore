@@ -1,0 +1,17 @@
+.git
+.venv
+venv
+__pycache__
+.pytest_cache
+*.py[cod]
+*.egg-info
+.env
+.env.*
+!*.env.example
+batch_results.csv
+verification_results.csv
+verification_results.json
+graph1_error_bound.png
+graph2_roi_vs_cr.png
+output.asice
+output_problem_images.asice
